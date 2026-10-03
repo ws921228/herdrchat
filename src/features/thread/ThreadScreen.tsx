@@ -200,9 +200,10 @@ export default function ThreadScreen({ workspaceId, title, onBack }: {
   const integrationKind = thread.agents.find(agent => agent.agent === 'codex' && agent.agentSession === null)
     ?? thread.agents.find(agent => agent.agentSession === null)
     ?? thread.agents[0];
-  const agentKind: 'claude' | 'codex' | 'omp' = integrationKind?.agent === 'codex'
+  const agentKind: 'claude' | 'codex' | 'hermes' | 'omp' = integrationKind?.agent === 'codex'
     ? 'codex'
-    : integrationKind?.agent === 'omp' ? 'omp' : 'claude';
+    : integrationKind?.agent === 'hermes' ? 'hermes'
+      : integrationKind?.agent === 'omp' ? 'omp' : 'claude';
   const installIntegration = useCallback(() => {
     if (client === null || installing) return;
     setInstalling(true);

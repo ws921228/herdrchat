@@ -9,6 +9,7 @@ import type { AgentInfo, Snapshot } from '@/lib/herdr/models';
 import type { FileProbe } from '@/lib/transcript/store';
 import type { ChatMessage } from '@/lib/transcript/message';
 import type { SessionMeta } from '@/lib/transcript/sessionMeta';
+import type { HermesChunk, HermesWindow } from '@/lib/transcript/hermesStore';
 import { HerdrError } from '@/lib/herdr/protocol';
 import { seedMessages, rebind, replaceMessages, tailCursor, setTailCursor } from '@/state/threadCache';
 import { useThread } from '../useThread';
@@ -34,6 +35,10 @@ let mockLiveReceipt = false;
 /** How many of the next tails fail right after opening, as a dropped stream does. */
 let mockTailFailures = 0;
 let mockEmitReceipt: ((message: ChatMessage) => void) | null = null;
+const mockHermesResolve = jest.fn<Promise<string | null>, [string]>();
+const mockHermesRecent = jest.fn<Promise<HermesWindow>, [string, string, string | null, number]>();
+const mockHermesOlder = jest.fn<Promise<HermesWindow>, [string, string, string | null, number, number]>();
+const mockHermesTail = jest.fn<AsyncIterable<HermesChunk>, [string, string, string | null, number, AbortSignal?]>();
 async function* mockTail(path: string, _label: string | null, from: number, signal?: AbortSignal) {
   mockTailStarts.push({ path, from });
   mockTailSignals.push(signal);
@@ -77,6 +82,14 @@ jest.mock('@/lib/transcript/store', () => ({
     older = mockOlder;
     sessionMeta = mockSessionMeta;
     tail = mockTail;
+  },
+}));
+jest.mock('@/lib/transcript/hermesStore', () => ({
+  HermesTranscriptStore: class {
+    resolveSession = mockHermesResolve;
+    recent = mockHermesRecent;
+    older = mockHermesOlder;
+    tail = mockHermesTail;
   },
 }));
 
@@ -138,6 +151,10 @@ beforeEach(() => {
   mockLiveMeta = [];
   mockLiveReceipt = false;
   mockEmitReceipt = null;
+  mockHermesResolve.mockReset().mockResolvedValue('/test/.hermes/state.db');
+  mockHermesRecent.mockReset().mockResolvedValue({ messages: [], meta: null, firstId: 0, lastId: 0, reachedStart: true });
+  mockHermesOlder.mockReset().mockResolvedValue({ messages: [], meta: null, firstId: 0, lastId: 0, reachedStart: true });
+  mockHermesTail.mockReset().mockImplementation(async function* () { yield* []; });
 });
 afterEach(() => {
   jest.restoreAllMocks();
@@ -260,6 +277,61 @@ it('opens a reported OMP path and keeps independently reported thinking settings
   expect(result.current.sessionState).toBe('ok');
   expect(result.current.error).toBeNull();
   expect(result.current.sessionMeta).toEqual({ model: 'gpt-5', effort: 'high', contextTokens: 200 });
+  await unmount();
+});
+
+it('reads Hermes SQLite history, pages by row id, and checkpoints the exact session', async () => {
+  const turn = (id: string): ChatMessage => ({ id, role: 'assistant', timestamp: 1,
+    agentLabel: null, isSidechain: false, segments: [{ kind: 'text', text: id }] });
+  mockHermesRecent.mockResolvedValue({ messages: [turn('hermes:session:20')],
+    meta: { model: 'hermes-model', contextTokens: null }, firstId: 20, lastId: 20, reachedStart: false });
+  mockHermesTail.mockImplementation(async function* () {
+    yield { message: turn('hermes:session:21'), meta: null, lastId: 21 };
+  });
+  mockHermesOlder.mockResolvedValue({ messages: [turn('hermes:session:10')],
+    meta: null, firstId: 10, lastId: 10, reachedStart: true });
+  jest.spyOn(client, 'snapshot').mockResolvedValue(snapshot([{
+    ...agent, agent: 'hermes', agentSession: { agent: 'hermes', kind: 'id', value: 'session', source: 'herdr:hermes' },
+  }]));
+  const { result, unmount } = await renderHook(() => useThread(db, client, 'host', 'chat', []));
+  expect(result.current.sessionState).toBe('ok');
+  expect(result.current.canSend).toBe(true);
+  expect(result.current.messages.map(message => message.id)).toEqual(['hermes:session:20', 'hermes:session:21']);
+  expect(result.current.sessionMeta?.model).toBe('hermes-model');
+  expect(mockHermesResolve).toHaveBeenCalledWith('session');
+  expect(rebind).toHaveBeenCalledWith(db, 'host', 'chat', 'hermes:session');
+  expect(mockHermesTail).toHaveBeenCalledWith('/test/.hermes/state.db', 'session', null, 20, expect.any(AbortSignal));
+  expect(setTailCursor).toHaveBeenCalledWith(db, 'host', 'chat', 'hermes:%2Ftest%2F.hermes%2Fstate.db:session', 21);
+  expect(mockRecent).not.toHaveBeenCalled();
+  expect(mockSessionMeta).not.toHaveBeenCalled();
+  await act(async () => { await result.current.loadOlder(); });
+  expect(mockHermesOlder).toHaveBeenCalledWith('/test/.hermes/state.db', 'session', null, 20, 150);
+  expect(result.current.messages.map(message => message.id)).toEqual(['hermes:session:10', 'hermes:session:20', 'hermes:session:21']);
+  expect(result.current.reachedStart).toBe(true);
+  expect(mockOlder).not.toHaveBeenCalled();
+  await unmount();
+});
+
+it('keeps Hermes history unread until its own native session is reported', async () => {
+  jest.spyOn(client, 'snapshot').mockResolvedValue(snapshot([{ ...agent, agent: 'hermes', agentSession: null }]));
+  const { result, unmount } = await renderHook(() => useThread(db, client, 'host', 'chat', []));
+  expect(result.current.sessionState).toBe('waiting');
+  expect(result.current.canSend).toBe(true);
+  expect(mockHermesResolve).not.toHaveBeenCalled();
+  expect(mockHermesRecent).not.toHaveBeenCalled();
+  expect(mockRecent).not.toHaveBeenCalled();
+  await unmount();
+});
+
+it('shows ambiguous Hermes history errors without substituting another conversation', async () => {
+  mockHermesResolve.mockRejectedValue(new Error('More than one Hermes database has this session id.'));
+  jest.spyOn(client, 'snapshot').mockResolvedValue(snapshot([{
+    ...agent, agent: 'hermes', agentSession: { agent: 'hermes', kind: 'id', value: 'session', source: 'herdr:hermes' },
+  }]));
+  const { result, unmount } = await renderHook(() => useThread(db, client, 'host', 'chat', []));
+  expect(result.current.error).toContain('More than one Hermes database');
+  expect(mockHermesRecent).not.toHaveBeenCalled();
+  expect(mockRecent).not.toHaveBeenCalled();
   await unmount();
 });
 

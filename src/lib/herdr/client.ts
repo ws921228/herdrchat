@@ -30,6 +30,7 @@ import {
   type WatcherState,
 } from '../notifier/watcher';
 import { AGENT_VERBS_VERSION, atLeast } from './version';
+import { installHermesCompatibility } from './hermesIntegration';
 
 // Kept here for `TranscriptStore` and the tests that grew up importing them from the client.
 export { exitCodeError, herdrErrorFrom } from './protocol';
@@ -40,7 +41,7 @@ export { exitCodeError, herdrErrorFrom } from './protocol';
 export type PromptOutcome = 'delivered' | 'stalled' | 'unverified';
 
 /** The built-in integrations HerdrChat can install and update. */
-export type IntegrationName = 'claude' | 'codex' | 'omp';
+export type IntegrationName = 'claude' | 'codex' | 'hermes' | 'omp';
 
 /**
  * How long to let herdr watch for the agent to react.
@@ -106,6 +107,8 @@ export class HerdrClient {
   readonly transport: HerdrTransport;
   /** The `herdr` executable name/path on the host (overridable if not on PATH). */
   private readonly herdr: string;
+  private hermesLaunchCommand: string | null = null;
+  private readonly hermesLaunches = new Set<string>();
   /**
    * The socket API on the same connection. Public so hooks can hold an
    * `events.subscribe` stream open; everything request-shaped goes through the
@@ -307,7 +310,7 @@ export class HerdrClient {
       return asArray(field(result, 'integrations')).flatMap((item) => {
         if (typeof item !== 'object' || item === null) return [];
         const { target, state } = item as { target?: unknown; state?: unknown };
-        return (target === 'claude' || target === 'codex' || target === 'omp') && state === 'outdated'
+        return (target === 'claude' || target === 'codex' || target === 'hermes' || target === 'omp') && state === 'outdated'
           ? [target]
           : [];
       });
@@ -322,6 +325,14 @@ export class HerdrClient {
       INSTALL_TIMEOUT_MS
     );
     checkEnvelope(output);
+    if (name === 'hermes') {
+      const compatibility = await installHermesCompatibility(this.transport, this.herdr);
+      if (!compatibility.ok) throw new HerdrError('hermes_compatibility_required',
+        `Could not prepare Hermes detection: ${compatibility.reason}. Check the host's Hermes detection override before starting a mobile chat.`);
+      if (!compatibility.launcher?.ok) throw new HerdrError('hermes_launcher_required',
+        'Could not prepare the Hermes launcher. Check that Hermes is installed and its runtime command is available on the host.');
+      this.hermesLaunchCommand = shellQuote(compatibility.launcher.command);
+    }
   }
 
   /**
@@ -783,6 +794,49 @@ export class HerdrClient {
     fallbackCommand: string,
     timeoutMs = LAUNCH_TIMEOUT_MS
   ): Promise<boolean> {
+    if (kind === 'hermes') {
+      if (this.hermesLaunchCommand === null) {
+        throw new HerdrError('hermes_launcher_required', 'Install the Hermes integration before starting a chat.');
+      }
+      // Hermes's Python -c launcher is invisible to Herdr 0.9.x. Use the
+      // prepared runtime launcher and verify readiness on this exact pane.
+      // Remember timed-out launches so a retry cannot type another launch
+      // command into an existing agent's input field.
+      if (!this.hermesLaunches.has(paneId)) {
+        this.hermesLaunches.add(paneId);
+        try {
+          await this.startAgent(paneId, [this.hermesLaunchCommand, ...agentArgs.map(shellQuote)].join(' '));
+        } catch (error) {
+          // These envelopes reject before writing. A lost SSH reply or an
+          // unparseable response leaves delivery uncertain, so retain the mark.
+          if (error instanceof HerdrError && !error.transport &&
+              ['invalid_request', 'invalid_params', 'pane_not_found', 'agent_pane_busy', 'herdr_not_found'].includes(error.code)) {
+            this.hermesLaunches.delete(paneId);
+          }
+          throw error;
+        }
+      }
+      const deadline = Date.now() + timeoutMs;
+      do {
+        const agent = (await this.agents()).find(candidate => candidate.paneId === paneId);
+        if (agent?.agent === 'hermes' && agent.agentStatus === 'idle') {
+          // Process detection can report idle while Hermes is still booting.
+          // Require the manifest to have observed its actual input screen.
+          const explanation = await this.explainAgent(paneId);
+          if (explanation !== null) {
+            try {
+              const state = JSON.parse(explanation) as { state?: string; visible_idle?: boolean; visible_working?: boolean; visible_blocker?: boolean };
+              if (state.state === 'idle' && state.visible_idle === true &&
+                  state.visible_working !== true && state.visible_blocker !== true) return false;
+            } catch { /* An unreadable diagnostic is not evidence of readiness. */ }
+          }
+        }
+        if (Date.now() >= deadline) break;
+        await new Promise(resolve => setTimeout(resolve, PANE_READY_INTERVAL_MS));
+      } while (Date.now() <= deadline);
+      throw new HerdrError('hermes_startup_timeout',
+        'Hermes started, but the host has not confirmed that it is ready. Check the host terminal, then retry.');
+    }
     if (!(await this.supportsAgentStart())) {
       await this.startAgent(paneId, fallbackCommand);
       return false;

@@ -12,6 +12,7 @@ import {
   projectDirName,
 } from './parser';
 import type { SessionMeta } from './sessionMeta';
+import { HermesTranscriptStore } from './hermesStore';
 
 /**
  * Reads Claude Code transcripts on the herdr host so chat threads show clean
@@ -669,6 +670,16 @@ export class TranscriptStore {
     requests: readonly PreviewRequest[],
     tailBytes = 48_000
   ): Promise<Map<string, ChatMessage>> {
+    const hermesRequests = requests.flatMap(request =>
+      request.agent === 'hermes' && request.sessionId !== null
+        ? [{ workspaceId: request.workspaceId, sessionId: request.sessionId }] : []
+    );
+    let hermesError: unknown;
+    const hermesMessages = hermesRequests.length === 0 ? new Map<string, ChatMessage>()
+      : await new HermesTranscriptStore(this.transport).latestMessages(hermesRequests).catch(error => {
+        hermesError = error;
+        return new Map<string, ChatMessage>();
+      });
     // A fresh marker per call. A transcript that happens to contain the literal
     // separator — a chat ABOUT this app writes it verbatim — used to split a
     // block in two and file the tail of one workspace's history under a
@@ -712,11 +723,18 @@ export class TranscriptStore {
       if (request.agent === 'omp') script += `head -n 2 "$f" 2>/dev/null; printf '\\n'; `;
       script += `[ -n "$f" ] && tail -c ${tailBytes} "$f" 2>/dev/null; `;
     }
-    if (script.length === 0) return new Map();
+    if (script.length === 0) {
+      if (hermesError !== undefined) throw hermesError;
+      return hermesMessages;
+    }
     script += 'true'; // a workspace without a transcript must not fail the batch
 
-    const text = await this.shell(script);
-    const result = new Map<string, ChatMessage>();
+    const text = await this.shell(script).catch(error => {
+      // A failed file-provider preview must not discard a readable Hermes row.
+      if (hermesMessages.size > 0) return '';
+      throw error;
+    });
+    const result = hermesMessages;
 
     for (const block of text.split(`\n${marker} `).slice(1)) {
       const headerEnd = block.indexOf('\n');
@@ -740,6 +758,7 @@ export class TranscriptStore {
       );
       if (last !== undefined) result.set(workspaceId, last);
     }
+    if (result.size === 0 && hermesError !== undefined) throw hermesError;
     return result;
   }
 

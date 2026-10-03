@@ -62,6 +62,7 @@ it('offers its swipe actions to assistive technology', async () => {
 it.each([
   ['claude', 'Claude · code/parser'],
   ['omp', 'OMP · code/parser'],
+  ['hermes', 'Hermes · code/parser'],
   ['letta', 'Letta · code/parser'],
   ['aider', 'aider · code/parser'],
   [null, 'Terminal'],

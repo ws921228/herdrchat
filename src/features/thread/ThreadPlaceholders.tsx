@@ -74,12 +74,12 @@ export function ThreadPlaceholder({
   onBack?: () => void;
   title: string;
   sessionState: SessionState;
-  agentKind?: 'claude' | 'codex' | 'omp';
+  agentKind?: 'claude' | 'codex' | 'hermes' | 'omp';
   onInstallIntegration?: () => void;
   installing: boolean;
   installError: string | null;
 }) {
-  const agentName = agentKind === 'omp' ? 'OMP' : agentKind === 'codex' ? 'Codex' : 'Claude';
+  const agentName = agentKind === 'omp' ? 'OMP' : agentKind === 'hermes' ? 'Hermes' : agentKind === 'codex' ? 'Codex' : 'Claude';
   return (
     <View
       style={{
@@ -100,7 +100,7 @@ export function ThreadPlaceholder({
         <>
           <Text variant="title3" style={{ textAlign: 'center' }}>Chat history is not supported for this agent</Text>
           <Text variant="subhead" color="secondary" style={{ textAlign: 'center' }}>
-            HerdrChat can read Claude Code, Codex, and OMP conversations. Open this agent in the host terminal to read its output.
+            HerdrChat can read Claude Code, Codex, Hermes, and OMP conversations. Open this agent in the host terminal to read its output.
           </Text>
         </>
       ) : sessionState === 'missing' ? (
@@ -117,8 +117,9 @@ export function ThreadPlaceholder({
           </Text>
           <Text variant="footnote" color="secondary" style={{ textAlign: 'center' }}>
             Install the integration, then resume or switch to this same session on the host when the agent is idle.
-            The integration reports at session start. Your running agent will not be restarted by this button.
+            {agentKind === 'hermes' ? ' Hermes reports its session when the first message starts a turn.' : ' The integration reports at session start.'} Your running agent will not be restarted by this button.
             {agentKind === 'codex' ? ' This adds a Codex launcher in ~/.local/bin for future chats. In the current Codex chat, find its session id with /status. When idle, exit and run herdrchat-codex resume <session-id>. Review the Herdr hook in /hooks if prompted.' : ''}
+            {agentKind === 'hermes' ? ' For an existing Hermes chat, keep the agent idle, then resume or switch back to that same Hermes session after installing.' : ''}
           </Text>
           {onInstallIntegration !== undefined && (
             <View style={{ marginTop: spacing.sm, alignSelf: 'stretch' }}>
@@ -163,6 +164,11 @@ export function ThreadPlaceholder({
           {agentKind === 'codex' && (
             <Text variant="footnote" color="secondary" style={{ textAlign: 'center' }}>
               For a new Codex chat, send your first message to start the session. For an existing chat, install the integration and resume the same session when idle.
+            </Text>
+          )}
+          {agentKind === 'hermes' && (
+            <Text variant="footnote" color="secondary" style={{ textAlign: 'center' }}>
+              For a new Hermes chat, send your first message to start the session. For an existing chat, install the integration and resume the same session when idle.
             </Text>
           )}
         </>

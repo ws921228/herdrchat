@@ -4,7 +4,14 @@ import { Text } from '@/components/Text';
 import { useTheme } from '@/theme/ThemeProvider';
 import { radius, spacing } from '@/theme/tokens';
 
-const NAMES = { claude: 'Claude', codex: 'Codex', omp: 'OMP' } as const;
+import type { IntegrationName } from '@/lib/herdr/client';
+
+const NAMES: Readonly<Record<IntegrationName, string>> = {
+  claude: 'Claude',
+  codex: 'Codex',
+  hermes: 'Hermes',
+  omp: 'OMP',
+};
 
 /**
  * herdr on this host reports one of its chat-agent integrations as out of date,
@@ -17,7 +24,7 @@ export function IntegrationBanner({
   error,
   onUpdate,
 }: {
-  outdated: readonly ('claude' | 'codex' | 'omp')[];
+  outdated: readonly IntegrationName[];
   updating: boolean;
   error: string | null;
   onUpdate: () => void;

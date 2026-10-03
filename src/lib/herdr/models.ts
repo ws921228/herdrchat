@@ -77,6 +77,9 @@ export interface AgentInfo {
  */
 export function hasSessionReference(agent: AgentInfo): boolean {
   const session = agent.agentSession;
+  if (agent.agent === 'hermes') {
+    return session?.agent === 'hermes' && session.kind === 'id' && (session.value ?? '') !== '';
+  }
   return (session?.value ?? '') !== '' &&
     (session?.kind === 'id' || (agent.agent === 'omp' && session?.kind === 'path'));
 }
@@ -93,9 +96,11 @@ export function sessionSignature(agents: readonly AgentInfo[]): string | null {
     .filter((agent) => agent.agent !== null && hasSessionReference(agent))
     .map((agent) => agent.agent === 'omp'
       ? `omp:${agent.agentSession?.kind}:${encodeURIComponent(agent.agentSession?.value ?? '')}`
-      : agent.agent === 'codex'
-        ? `codex:${agent.agentSession?.value ?? ''}`
-        : agent.agentSession?.value ?? '')
+      : agent.agent === 'hermes'
+        ? `hermes:${agent.agentSession?.value ?? ''}`
+        : agent.agent === 'codex'
+          ? `codex:${agent.agentSession?.value ?? ''}`
+          : agent.agentSession?.value ?? '')
     .filter((value) => value !== '');
   if (ids.length === 0) return null;
   return [...new Set(ids)].sort().join(',');
@@ -254,8 +259,12 @@ export function decodeAgentSessionRef(raw: unknown): AgentSessionRef | null {
 
 export function decodeAgentInfo(raw: unknown): AgentInfo {
   const value = record(raw);
+  const agentSession = decodeAgentSessionRef(value.agent_session);
   return {
-    agent: optionalStr(value.agent),
+    // Herdr's Hermes plugin can report identity without a detected process kind.
+    agent: optionalStr(value.agent) ?? (agentSession?.agent === 'hermes' &&
+      agentSession.source === 'herdr:hermes' && agentSession.kind === 'id' &&
+      (agentSession.value ?? '') !== '' ? 'hermes' : null),
     agentStatus: toAgentStatus(value.agent_status),
     cwd: str(value.cwd),
     foregroundCwd: optionalStr(value.foreground_cwd),
@@ -264,7 +273,7 @@ export function decodeAgentInfo(raw: unknown): AgentInfo {
     tabId: str(value.tab_id),
     terminalId: optionalStr(value.terminal_id),
     workspaceId: str(value.workspace_id),
-    agentSession: decodeAgentSessionRef(value.agent_session),
+    agentSession,
     stateChangeSeq: optionalNum(value.state_change_seq),
     completionSeq: optionalNum(value.completion_seq),
     inputPending: value.input_pending === true,

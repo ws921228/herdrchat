@@ -1,6 +1,7 @@
 import type { ChatMessage, MessageRole, MessageSegment } from './message';
 import { codexEntry } from './codex';
 import { claudeCommandOutput, claudeUserText, isClaudeHarnessLine } from './harness';
+import { hermesEntry } from './hermes';
 import { splitImages } from './images';
 import { ompEntry } from './omp';
 import type { SessionMeta } from './sessionMeta';
@@ -51,6 +52,7 @@ export function parseTranscriptEntry(
 ): TranscriptEntry {
   const raw = parseJson(line);
   if (raw === null) return EMPTY_ENTRY;
+  if (isHermes(raw)) return hermesEntry(raw, agentLabel);
   if (isCodex(raw)) return codexEntry(raw, fallbackId(line), agentLabel);
   if (isOmp(raw)) return ompEntry(raw, fallbackId(line), agentLabel);
   return { message: messageFrom(raw, line, agentLabel), meta: metaFrom(raw) };
@@ -80,8 +82,13 @@ export function parseTranscriptLine(
 export function assistantMeta(line: string): SessionMeta | null {
   const raw = parseJson(line);
   if (raw === null) return null;
+  if (isHermes(raw)) return hermesEntry(raw, null).meta;
   if (isCodex(raw)) return codexEntry(raw, '', null).meta;
   return isOmp(raw) ? ompEntry(raw, '', null).meta : metaFrom(raw);
+}
+
+function isHermes(raw: Record<string, unknown>): boolean {
+  return raw.type === 'hermes_message';
 }
 
 function isCodex(raw: Record<string, unknown>): boolean {

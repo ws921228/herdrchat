@@ -32,7 +32,14 @@ import {
   answeredReply,
   commandLines,
   DEMO_BLOCKED_SCREEN,
+  DEMO_HERMES_DB,
+  DEMO_HERMES_SESSION_IDS,
   DEMO_OMP_PATHS,
+  HERMES_MODEL,
+  hermesAssistantRow,
+  type HermesDemoRow,
+  hermesRowsFor,
+  hermesUserRow,
   ompLine,
   DEMO_HOME,
   DEMO_SESSION_IDS,
@@ -68,6 +75,10 @@ function ok(result: unknown): ExecResult {
 /** Raw stdout, for the commands that are `sh` rather than herdr. */
 function out(stdout: string): ExecResult {
   return { ok: true, stdout, stderr: '', exitCode: 0 };
+}
+
+function jsonOut(value: unknown): ExecResult {
+  return out(JSON.stringify(value));
 }
 
 function exit(code: number): ExecResult {
@@ -198,6 +209,8 @@ interface Questions {
 export class DemoHost implements HerdrTransport {
   /** Transcripts by pane, mutable because the demo agent writes to them. */
   private readonly transcripts = new Map<string, string>();
+  /** Hermes message rows by pane, mutable because Hermes writes to SQLite. */
+  private readonly hermesRows = new Map<string, HermesDemoRow[]>();
   /** Absolute transcript path → pane, so a file read resolves to a conversation. */
   private readonly paths = new Map<string, string>();
   /** Agent status by pane, mutable because answering a prompt unblocks it. */
@@ -213,7 +226,8 @@ export class DemoHost implements HerdrTransport {
   constructor(private readonly now: () => number = () => Date.now()) {
     for (const workspace of DEMO_WORKSPACES) {
       this.statuses.set(workspace.paneId, workspace.agentStatus);
-      this.transcripts.set(workspace.paneId, transcriptFor(workspace.paneId));
+      if (workspace.agent === 'hermes') this.hermesRows.set(workspace.paneId, [...hermesRowsFor(workspace.paneId)]);
+      else this.transcripts.set(workspace.paneId, transcriptFor(workspace.paneId));
       const ompPath = DEMO_OMP_PATHS[workspace.paneId];
       if (ompPath !== undefined) this.paths.set(ompPath, workspace.paneId);
       const session = DEMO_SESSION_IDS[workspace.paneId];
@@ -240,9 +254,12 @@ export class DemoHost implements HerdrTransport {
         for (const written of due.lines(() => this.uuid(), this.stamp())) this.append(due.paneId, written);
       } else {
         const text = due.answer === undefined ? replyFor(due.prompt) : answeredReply(due.answer);
-        this.append(due.paneId, this.isOmp(due.paneId)
-          ? ompLine('assistant', text, this.uuid(), this.stamp())
-          : replyLine(text, this.uuid(), this.stamp()));
+        if (this.isHermes(due.paneId)) this.appendHermesAssistant(due.paneId, text);
+        else {
+          this.append(due.paneId, this.isOmp(due.paneId)
+            ? ompLine('assistant', text, this.uuid(), this.stamp())
+            : replyLine(text, this.uuid(), this.stamp()));
+        }
       }
       this.statuses.set(due.paneId,
         this.pending.some(reply => reply.paneId === due.paneId) ? 'working' : 'idle');
@@ -252,6 +269,33 @@ export class DemoHost implements HerdrTransport {
   private append(paneId: string, jsonLine: string): void {
     const existing = this.transcripts.get(paneId) ?? '';
     this.transcripts.set(paneId, `${existing}${jsonLine}\n`);
+  }
+
+  private appendHermesUser(paneId: string, text: string): void {
+    const session = DEMO_HERMES_SESSION_IDS[paneId];
+    if (session === undefined) return;
+    this.appendHermes(paneId, hermesUserRow(session, this.nextHermesRowId(paneId), text, this.stamp()));
+  }
+
+  private appendHermesAssistant(paneId: string, text: string): void {
+    const session = DEMO_HERMES_SESSION_IDS[paneId];
+    if (session === undefined) return;
+    this.appendHermes(paneId, hermesAssistantRow(
+      session,
+      this.nextHermesRowId(paneId),
+      text,
+      this.stamp(),
+      'Writing a demo response from the Hermes SQLite session.'
+    ));
+  }
+
+  private appendHermes(paneId: string, row: HermesDemoRow): void {
+    const rows = this.hermesRows.get(paneId) ?? [];
+    this.hermesRows.set(paneId, [...rows, row]);
+  }
+
+  private nextHermesRowId(paneId: string): number {
+    return Math.max(0, ...(this.hermesRows.get(paneId) ?? []).map(row => row.row_id)) + 1;
   }
 
   private uuid(): string {
@@ -269,7 +313,14 @@ export class DemoHost implements HerdrTransport {
    * the consumer abandons the iterator when the thread goes away.
    */
   async *streamLines(command: string, _startTimeoutMs: number, signal?: AbortSignal): AsyncIterable<string> {
-    const follow = /^tail -c \+(\d+) -f '(.+?)'$/.exec(withoutPath(command));
+    const body = withoutPath(command);
+    const hermes = this.hermesStream(parseArgv(body), signal);
+    if (hermes !== null) {
+      yield* hermes;
+      return;
+    }
+
+    const follow = /^tail -c \+(\d+) -f '(.+?)'$/.exec(body);
     if (follow === null) return;
 
     const path = follow[2]!;
@@ -301,6 +352,11 @@ export class DemoHost implements HerdrTransport {
 
   /** `sh` reading transcripts. Returns null when the command is not one of these. */
   private filesystem(body: string): ExecResult | null {
+    if (body.includes('herdr-hermes.py')) return jsonOut({ ok: true, status: 'not_needed',
+      launcher: { ok: true, status: 'already_installed', path: 'hermes', command: 'hermes' } });
+    const hermes = this.hermesCommand(parseArgv(body));
+    if (hermes !== null) return hermes;
+
     if (body === 'printf %s "$HOME"') return out(DEMO_HOME);
     if (body === 'printf %s "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"') return out(`${DEMO_HOME}/.claude`);
 
@@ -357,8 +413,117 @@ export class DemoHost implements HerdrTransport {
     return DEMO_OMP_PATHS[paneId] !== undefined;
   }
 
+  private isHermes(paneId: string): boolean {
+    return DEMO_HERMES_SESSION_IDS[paneId] !== undefined;
+  }
+
   private statusOf(paneId: string): string {
     return this.statuses.get(paneId) ?? 'idle';
+  }
+
+  private hermesCommand(argv: string[]): ExecResult | null {
+    if (!this.isHermesHelper(argv)) return null;
+    const mode = argv[3] ?? '';
+    if (mode === 'resolve') {
+      const pane = this.hermesPaneForSession(argv[4] ?? '');
+      return jsonOut({ ok: true, path: pane === null ? null : DEMO_HERMES_DB });
+    }
+    if (mode === 'latest') {
+      return this.hermesLatest(argv[4] ?? '[]');
+    }
+    const path = argv[4] ?? '';
+    const sessionId = argv[5] ?? '';
+    if (path !== DEMO_HERMES_DB) return jsonOut(this.emptyHermesWindow());
+    if (mode === 'recent') return jsonOut(this.hermesWindow(sessionId, null, Number(argv[6] ?? 200)));
+    if (mode === 'older') return jsonOut(this.hermesWindow(sessionId, Number(argv[6] ?? 0), Number(argv[7] ?? 200)));
+    return null;
+  }
+
+  private hermesStream(argv: string[], signal?: AbortSignal): AsyncIterable<string> | null {
+    if (!this.isHermesHelper(argv) || argv[3] !== 'tail') return null;
+    const path = argv[4] ?? '';
+    const sessionId = argv[5] ?? '';
+    let lastId = Number(argv[6] ?? 0);
+    if (path !== DEMO_HERMES_DB || this.hermesPaneForSession(sessionId) === null) {
+      return (async function* empty() {})();
+    }
+    const host = this;
+    return (async function* stream() {
+      while (!signal?.aborted) {
+        host.materialise();
+        const rows = host.hermesRowsForSession(sessionId).filter(row => row.row_id > lastId);
+        if (rows.length === 0) {
+          yield JSON.stringify({ ok: true, message: null, meta: host.hermesMeta(sessionId), lastId });
+        } else {
+          for (const row of rows) {
+            lastId = row.row_id;
+            yield JSON.stringify({ ok: true, message: row, meta: host.hermesMeta(sessionId), lastId });
+          }
+        }
+        await new Promise((resolve) => setTimeout(resolve, TAIL_POLL_MS));
+      }
+    })();
+  }
+
+  private isHermesHelper(argv: readonly string[]): boolean {
+    return argv[0] === 'python3' && argv[1] === '-c' && ['resolve', 'recent', 'older', 'latest', 'tail'].includes(argv[3] ?? '');
+  }
+
+  private hermesLatest(serialized: string): ExecResult {
+    let requests: unknown;
+    try {
+      requests = JSON.parse(serialized);
+    } catch {
+      requests = [];
+    }
+    const messages: Record<string, HermesDemoRow[]> = {};
+    if (Array.isArray(requests)) {
+      for (const request of requests) {
+        if (typeof request !== 'object' || request === null) continue;
+        const workspaceId = 'workspaceId' in request && typeof request.workspaceId === 'string' ? request.workspaceId : null;
+        const sessionId = 'sessionId' in request && typeof request.sessionId === 'string' ? request.sessionId : null;
+        if (workspaceId === null || sessionId === null) continue;
+        const rows = [...this.hermesRowsForSession(sessionId)].reverse().slice(0, 20);
+        if (rows.length > 0) messages[workspaceId] = rows;
+      }
+    }
+    return jsonOut({ ok: true, messages });
+  }
+
+  private hermesWindow(sessionId: string, beforeId: number | null, limit: number): unknown {
+    const rows = this.hermesRowsForSession(sessionId);
+    const eligible = beforeId === null ? rows : rows.filter(row => row.row_id < beforeId);
+    const selected = eligible.slice(Math.max(0, eligible.length - Math.max(0, limit)));
+    const firstId = selected[0]?.row_id ?? 0;
+    const lastId = selected.at(-1)?.row_id ?? beforeId ?? 0;
+    return {
+      ok: true,
+      messages: selected,
+      meta: this.hermesMeta(sessionId),
+      firstId,
+      lastId,
+      reachedStart: firstId === 0 || rows.every(row => row.row_id >= firstId),
+    };
+  }
+
+  private emptyHermesWindow(): unknown {
+    return { ok: true, messages: [], meta: null, firstId: 0, lastId: 0, reachedStart: true };
+  }
+
+  private hermesRowsForSession(sessionId: string): readonly HermesDemoRow[] {
+    const pane = this.hermesPaneForSession(sessionId);
+    return pane === null ? [] : this.hermesRows.get(pane) ?? [];
+  }
+
+  private hermesPaneForSession(sessionId: string): string | null {
+    for (const [paneId, known] of Object.entries(DEMO_HERMES_SESSION_IDS)) {
+      if (known === sessionId) return paneId;
+    }
+    return null;
+  }
+
+  private hermesMeta(sessionId: string): { model: string; contextTokens: null } | null {
+    return this.hermesPaneForSession(sessionId) === null ? null : { model: HERMES_MODEL, contextTokens: null };
   }
 
   private workspaceRows(): unknown[] {
@@ -388,7 +553,9 @@ export class DemoHost implements HerdrTransport {
       ...(this.trusting.has(w.paneId) ? { input_pending: true, input_prompt_kind: 'unknown' } : {}),
       agent_session: w.agent === 'omp'
         ? { agent: 'omp', kind: 'path', source: 'herdr:omp', value: DEMO_OMP_PATHS[w.paneId] ?? null }
-        : { agent: 'claude', kind: 'id', source: 'herdr:claude', value: DEMO_SESSION_IDS[w.paneId] ?? null },
+        : w.agent === 'hermes'
+          ? { agent: 'hermes', kind: 'id', source: 'herdr:hermes', value: DEMO_HERMES_SESSION_IDS[w.paneId] ?? null }
+          : { agent: 'claude', kind: 'id', source: 'herdr:claude', value: DEMO_SESSION_IDS[w.paneId] ?? null },
     }));
   }
 
@@ -465,8 +632,9 @@ export class DemoHost implements HerdrTransport {
           message: `agent ${paneId} has a pending unknown input prompt; chat prompt was not written`,
         } }));
       }
-      if (text.trim().startsWith('/') && !this.isOmp(paneId)) return this.command(paneId, text);
-      this.append(paneId, this.isOmp(paneId) ? ompLine('user', text, this.uuid(), this.stamp()) : userLine(text, this.uuid(), this.stamp()));
+      if (text.trim().startsWith('/') && !this.isOmp(paneId) && !this.isHermes(paneId)) return this.command(paneId, text);
+      if (this.isHermes(paneId)) this.appendHermesUser(paneId, text);
+      else this.append(paneId, this.isOmp(paneId) ? ompLine('user', text, this.uuid(), this.stamp()) : userLine(text, this.uuid(), this.stamp()));
       const asked = text.toLowerCase();
       if (asked.includes(DEMO_PHRASES.questions)) return this.askQuestions(paneId);
       if (asked.includes(DEMO_PHRASES.tools)) return this.runChecks(paneId);

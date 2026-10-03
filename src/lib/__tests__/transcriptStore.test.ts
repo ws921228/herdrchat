@@ -460,6 +460,28 @@ describe('older history', () => {
 });
 
 describe('batched last-message lookup', () => {
+  it('keeps the Hermes preview when another provider cannot be read', async () => {
+    const commands: string[] = [];
+    const transport: HerdrTransport = {
+      exec: async command => {
+        commands.push(command);
+        if (command.includes('python3')) return ok(JSON.stringify({ ok: true, messages: {
+          w9: { row_id: 7, session_id: 'hermes_session', role: 'assistant', content: 'Hermes reply', timestamp: 1 },
+        } }));
+        throw new Error('Other transcript read failed');
+      },
+      streamLines: async function* () { yield* []; },
+    };
+    const result = await new TranscriptStore(transport).latestMessages([
+      { workspaceId: 'w9', cwd: '/srv/app', sessionId: 'hermes_session', agent: 'hermes' },
+      { workspaceId: 'w8', cwd: '/srv/app', sessionId: 'claude-session', agent: 'claude' },
+    ]);
+    expect(displayText(result.get('w9')!)).toBe('Hermes reply');
+    expect(result.has('w8')).toBe(false);
+    expect(commands).toHaveLength(2);
+    expect(commands[1]).not.toContain('hermes_session.jsonl');
+  });
+
   // A workspace whose session isn't known yet must NOT fall back to the newest
   // .jsonl in the project dir: that previews a previous chat's last message
   // under a reused workspace, which is a reported bug, not a theory.

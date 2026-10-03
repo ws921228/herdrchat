@@ -1,10 +1,11 @@
 import { HerdrClient } from '../herdr/client';
 import { DemoHost } from '../demo/host';
-import { DEMO_SESSION_IDS, DEMO_WORKSPACES, transcriptFor } from '../demo/fixtures';
+import { DEMO_HERMES_DB, DEMO_HERMES_SESSION_IDS, DEMO_SESSION_IDS, DEMO_WORKSPACES, HERMES_MODEL, transcriptFor } from '../demo/fixtures';
 import { parseBlockedPrompt } from '../transcript/blockedPrompt';
 import { displayText } from '../transcript/message';
 import { parsePaneOverlay } from '../transcript/paneOverlay';
 import { threadItems, toolRunSummary } from '../threadItems';
+import { HermesTranscriptStore } from '../transcript/hermesStore';
 import { TranscriptStore } from '../transcript/store';
 
 /** A demo workspace's transcript path, built by the real path rules. */
@@ -31,7 +32,7 @@ describe('DemoHost as a herdr host', () => {
   it('lists workspaces, so the chat list has something to show', async () => {
     const client = new HerdrClient(new DemoHost());
     const workspaces = await client.workspaces();
-    expect(workspaces.map((w) => w.label)).toEqual(['herdrchat', 'notes', 'scratch', 'ledger']);
+    expect(workspaces.map((w) => w.label)).toEqual(['herdrchat', 'notes', 'scratch', 'ledger', 'hermes']);
   });
 
   it('reports one workspace as blocked, because that is the state worth seeing', async () => {
@@ -120,7 +121,7 @@ describe('DemoHost as an agent', () => {
       await expect(operation()).rejects.toThrow('Select your own host');
     }
     expect((await client.workspaces()).map(workspace => workspace.label))
-      .toEqual(['herdrchat', 'notes', 'scratch', 'ledger']);
+      .toEqual(['herdrchat', 'notes', 'scratch', 'ledger', 'hermes']);
   });
 
   it.each([false, true])('stops only the selected demo agent (hard: %s)', async hard => {
@@ -345,4 +346,68 @@ describe('DemoHost as an OMP host', () => {
     expect(after.slice(-2).map((m) => m.role)).toEqual(['user', 'assistant']);
     expect(displayText(after.at(-2)!)).toBe('and february?');
   });
+});
+
+// Hermes reports a native session id; the reader resolves that id to its SQLite
+// database and streams rows, not JSONL transcript bytes.
+describe('DemoHost as a Hermes host', () => {
+  it('reports the native session id herdr installed for Hermes', async () => {
+    const client = new HerdrClient(new DemoHost());
+    const agent = (await client.agents()).find((a) => a.agent === 'hermes')!;
+    expect(agent.paneId).toBe('w5:p1');
+    expect(agent.agentSession).toEqual({
+      agent: 'hermes',
+      kind: 'id',
+      source: 'herdr:hermes',
+      value: DEMO_HERMES_SESSION_IDS['w5:p1'],
+    });
+  });
+
+  it('resolves and reads the exact demo SQLite session', async () => {
+    const host = new DemoHost();
+    const store = new HermesTranscriptStore(host);
+    const sessionId = DEMO_HERMES_SESSION_IDS['w5:p1']!;
+
+    await expect(store.resolveSession(sessionId)).resolves.toBe(DEMO_HERMES_DB);
+
+    const recent = await store.recent(DEMO_HERMES_DB, sessionId, 'Hermes', 20);
+    expect(recent).toMatchObject({
+      meta: { model: HERMES_MODEL, contextTokens: null },
+      firstId: 1,
+      lastId: 2,
+      reachedStart: true,
+    });
+    expect(recent.messages.map((message) => message.role)).toEqual(['user', 'assistant']);
+    expect(displayText(recent.messages.at(-1)!)).toContain('demo SQLite transport');
+
+    const latest = await store.latestMessages([{ workspaceId: 'w5', sessionId }]);
+    expect(displayText(latest.get('w5')!)).toContain('demo SQLite transport');
+  });
+
+  it('writes a live prompt and streams the answer back by row id', async () => {
+    let now = 1_000;
+    const host = new DemoHost(() => now);
+    const client = new HerdrClient(host);
+    const store = new HermesTranscriptStore(host);
+    const sessionId = DEMO_HERMES_SESSION_IDS['w5:p1']!;
+    const before = await store.recent(DEMO_HERMES_DB, sessionId, 'Hermes', 20);
+    const controller = new AbortController();
+    const seen: string[] = [];
+
+    await client.sendPrompt('w5:p1', 'does Hermes tail work?');
+    now += 10_000;
+
+    try {
+      for await (const chunk of store.tail(DEMO_HERMES_DB, sessionId, 'Hermes', before.lastId, controller.signal)) {
+        if (chunk.message !== null) seen.push(displayText(chunk.message));
+        if (seen.length === 2) break;
+      }
+    } finally {
+      controller.abort();
+    }
+
+    expect(seen[0]).toBe('does Hermes tail work?');
+    expect(seen[1]).toContain('does Hermes tail work?');
+    expect((await client.workspaces()).find((workspace) => workspace.workspaceId === 'w5')?.agentStatus).toBe('idle');
+  }, 15_000);
 });

@@ -4,7 +4,7 @@
 
 You need an iPhone or iPad running iOS 17+ with
 [HerdrChat from the App Store](https://apps.apple.com/app/herdrchat/id6791874615), and a computer you administer. That computer
-runs [herdr](https://herdr.dev) and Claude Code, Codex or [OMP](https://omp.sh/). The phone connects over
+runs [herdr](https://herdr.dev) and Claude Code, Codex, [OMP](https://omp.sh/) or Hermes. The phone connects over
 SSH, usually through your existing Tailscale network. Keep SSH on your private
 network; there is no need to expose it to the internet.
 
@@ -77,6 +77,46 @@ journal boundaries; this is not OMP's active-branch tree view. Replies appear
 when OMP persists them, not token by token. The existing SSH transcript reader
 requires a POSIX host shell and absolute POSIX paths without `..` segments;
 Windows-native paths are not translated.
+
+### Hermes
+
+Hermes support is available in this fork's local builds. The upstream App Store
+app does not acquire this feature by adding the fork as a host.
+
+Install Herdr's Hermes plugin on the host with Hermes and Python 3 available:
+
+```sh
+herdr integration install hermes
+python3 scripts/herdr-hermes.py --herdr herdr
+```
+
+Run the second command from this repository on the host. **New chat → Hermes**
+performs both steps automatically. The compatibility helper handles the known
+older Herdr rule that does not recognize the current Hermes CLI prompt. It
+preserves approval and working-state detection, refuses unrelated custom
+overrides, and verifies that Herdr loaded the rule before reporting success.
+It also creates `~/.local/bin/herdrchat-hermes`, a managed launcher that makes
+the Python-wrapped Hermes process recognizable to Herdr. It preserves the
+original `hermes` executable and refuses to replace an unrelated launcher.
+Pass `--session <name>` when preparing a named Herdr session.
+
+Start or resume Hermes inside a Herdr pane after installation so the plugin
+can report the native session ID. Choose **Hermes** in **New chat** to start
+the prepared launcher on the selected host; the app verifies that the same
+pane is ready before opening the chat. For a manual start, use
+`~/.local/bin/herdrchat-hermes` in the Herdr pane. To attach an existing conversation, resume that
+same session on the host; the app never substitutes the newest conversation.
+
+The app reads Hermes's `state.db` over SSH in read-only mode. It looks up the
+exact reported ID under `HERMES_HOME` (default `~/.hermes`) and its
+`profiles/*/state.db` directories. For a custom home, make `HERMES_HOME`
+available to the noninteractive SSH shell as well as the Hermes process.
+Duplicate matches are refused. History paging and reconnect checkpoints use
+SQLite row IDs scoped to the database and session.
+
+Saved user messages, assistant replies, reasoning and tool activity appear in
+the conversation. Updates appear when Hermes saves them, rather than token by
+token. The app preserves Hermes's own model and permission settings.
 
 ## Connect the phone
 

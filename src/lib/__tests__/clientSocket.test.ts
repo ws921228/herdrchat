@@ -1,4 +1,5 @@
 import { HerdrClient } from '../herdr/client';
+import { HerdrError } from '../herdr/protocol';
 import { isSocketProbe } from '../herdr/socket';
 import type { HerdrTransport } from '../herdr/transport';
 
@@ -33,6 +34,97 @@ const requestIn = (command: string): { method: string; params: Record<string, un
   const end = command.lastIndexOf(`}'`);
   return JSON.parse(command.slice(start + 1, end + 1).replaceAll(`'\\''`, "'")) as never;
 };
+
+describe('Hermes host preparation', () => {
+  const host = (compatible: boolean, state = 'idle', reportedPane = 'p1', visibleIdle = true) => {
+    const commands: string[] = [];
+    const client = new HerdrClient({
+      exec: async command => {
+        commands.push(command);
+        return { ok: true, exitCode: 0, stderr: '', stdout: JSON.stringify(
+          command.includes('herdr-hermes.py')
+            ? compatible ? { ok: true, status: 'installed', launcher: {
+              ok: true, status: 'installed', path: '/home/a user/.local/bin/herdrchat-hermes', command: '/home/a user/.local/bin/herdrchat-hermes',
+            } }
+              : { ok: false, status: 'refused', reason: 'custom_override_exists' }
+            : command.includes("'agent' 'explain'")
+              ? { state, visible_idle: visibleIdle }
+            : command.includes("'agent' 'list'")
+              ? { id: 'list', result: { agents: [{ agent: 'hermes', agent_status: state, pane_id: reportedPane }] } }
+              : { id: 'install', result: { type: 'integration_installed' } }
+        ) };
+      },
+      streamLines: async function* () { yield* []; },
+    }, '/opt/herdr bin/herdr');
+    return { client, commands };
+  };
+
+  it('prepares current Hermes detection after installing the native plugin', async () => {
+    const { client, commands } = host(true);
+    await client.installIntegration('hermes');
+    expect(commands).toHaveLength(2);
+    expect(commands[0]).toContain("'integration' 'install' 'hermes'");
+    expect(commands[1]).toContain('herdr-hermes.py');
+    expect(commands[1]).toContain("'/opt/herdr bin/herdr'");
+  });
+
+  it('explains when an existing custom Hermes detector needs review', async () => {
+    const { client } = host(false);
+    await expect(client.installIntegration('hermes')).rejects.toMatchObject({
+      code: 'hermes_compatibility_required', message: expect.stringContaining('custom_override_exists'),
+    });
+  });
+
+  it('launches the prepared runtime and verifies the same pane before returning', async () => {
+    const { client, commands } = host(true);
+    await client.installIntegration('hermes');
+    await expect(client.startNamedAgent('p1', 'chat', 'hermes', [], 'hermes', 0)).resolves.toBe(false);
+    const launches = commands.filter(command => command.includes("'pane' 'run'"));
+    expect(launches).toHaveLength(1);
+    expect(launches[0]).toContain('/home/a user/.local/bin/herdrchat-hermes');
+    expect(commands.some(command => command.includes("'agent' 'start'"))).toBe(false);
+  });
+
+  it.each([['unknown', 'p1'], ['idle', 'another-pane'], ['working', 'p1'], ['blocked', 'p1']])(
+    'refuses unverified readiness (%s, %s) and avoids relaunching on retry', async (state, pane) => {
+      const { client, commands } = host(true, state, pane);
+      await client.installIntegration('hermes');
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        await expect(client.startNamedAgent('p1', 'chat', 'hermes', [], 'hermes', 0))
+          .rejects.toMatchObject({ code: 'hermes_startup_timeout' });
+      }
+      expect(commands.filter(command => command.includes("'pane' 'run'"))).toHaveLength(1);
+    }
+  );
+
+  it('requires preparation before launching Hermes', async () => {
+    const { client, commands } = host(true);
+    await expect(client.startNamedAgent('p1', 'chat', 'hermes', [], 'hermes', 0))
+      .rejects.toMatchObject({ code: 'hermes_launcher_required' });
+    expect(commands).toHaveLength(0);
+  });
+
+  it('does not mistake process-detection idle for a ready input screen', async () => {
+    const { client } = host(true, 'idle', 'p1', false);
+    await client.installIntegration('hermes');
+    await expect(client.startNamedAgent('p1', 'chat', 'hermes', [], 'hermes', 0))
+      .rejects.toMatchObject({ code: 'hermes_startup_timeout' });
+  });
+
+  it('retries a launch rejected before writing, but preserves an uncertain delivery', async () => {
+    for (const uncertain of [false, true]) {
+      const { client, commands } = host(true);
+      await client.installIntegration('hermes');
+      const launch = jest.spyOn(client, 'startAgent');
+      launch.mockRejectedValueOnce(new HerdrError(uncertain ? 'timeout' : 'agent_pane_busy', 'not ready', { transport: uncertain }));
+      await expect(client.startNamedAgent('p1', 'chat', 'hermes', [], 'hermes', 0)).rejects.toBeInstanceOf(HerdrError);
+      await expect(client.startNamedAgent('p1', 'chat', 'hermes', [], 'hermes', 0)).resolves.toBe(false);
+      expect(launch).toHaveBeenCalledTimes(uncertain ? 1 : 2);
+      expect(commands.filter(command => command.includes("'pane' 'run'"))).toHaveLength(uncertain ? 0 : 1);
+      launch.mockRestore();
+    }
+  });
+});
 
 describe('HerdrClient over the socket', () => {
   it('reads the snapshot with session.snapshot and remembers the version', async () => {
@@ -176,20 +268,21 @@ describe('HerdrClient over the socket', () => {
 
   describe('outdatedIntegrations (#93)', () => {
     // The shape herdr answers, trimmed.
-    const list = (claude: string, codex: string, omp: string) =>
+    const list = (claude: string, codex: string, hermes: string, omp: string) =>
       `{"id":"x","result":{"type":"integration_list","integrations":[` +
       `{"target":"pi","label":"pi","command":"pi","available":false,"state":"not_installed"},` +
       `{"target":"claude","label":"claude","command":"claude","available":true,"state":"${claude}"},` +
       `{"target":"codex","label":"codex","command":"codex","available":true,"state":"${codex}"},` +
+      `{"target":"hermes","label":"hermes","command":"hermes","available":true,"state":"${hermes}"},` +
       `{"target":"omp","label":"omp","command":"omp","available":true,"state":"${omp}"}]}}`;
 
     it('names the integrations the host reports as outdated', async () => {
-      const { client } = socketHost({ 'integration.list': list('outdated', 'current', 'outdated') });
-      await expect(client.outdatedIntegrations()).resolves.toEqual(['claude', 'omp']);
+      const { client } = socketHost({ 'integration.list': list('outdated', 'current', 'outdated', 'outdated') });
+      await expect(client.outdatedIntegrations()).resolves.toEqual(['claude', 'hermes', 'omp']);
     });
 
     it('reports none when everything is current', async () => {
-      const { client } = socketHost({ 'integration.list': list('current', 'current', 'current') });
+      const { client } = socketHost({ 'integration.list': list('current', 'current', 'current', 'current') });
       await expect(client.outdatedIntegrations()).resolves.toEqual([]);
     });
 

@@ -15,10 +15,10 @@ import { HerdrError } from '@/lib/herdr/protocol';
 import { getSetting, setSetting } from '@/state/db';
 
 /** The agents a new chat can start. All have chat support once running. */
-export type NewChatAgent = 'claude' | 'codex' | 'omp';
+export type NewChatAgent = 'claude' | 'codex' | 'hermes' | 'omp';
 
 const isAgent = (value: unknown): value is NewChatAgent =>
-  value === 'claude' || value === 'codex' || value === 'omp';
+  value === 'claude' || value === 'codex' || value === 'hermes' || value === 'omp';
 
 export interface Remembered {
   cwd: string;
@@ -79,6 +79,9 @@ export function useStartChat(connectionId: string | null) {
     setCreating(true);
     setError(null);
     try {
+      // Prepare the native session hook and current Hermes prompt detection
+      // before launching; otherwise the first mobile message has no target.
+      if (choice.agent === 'hermes') await client.installIntegration('hermes');
       let creation = pending.current?.directory === choice.directory ? pending.current.creation : null;
       if (creation === null) {
         if (pending.current !== null) {

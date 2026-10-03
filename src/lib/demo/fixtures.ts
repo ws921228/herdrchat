@@ -16,8 +16,8 @@ export interface DemoWorkspace {
   paneId: string;
   cwd: string;
   agentStatus: 'idle' | 'working' | 'blocked' | 'done';
-  /** Claude unless named; OMP reports its journal's path rather than an id. */
-  agent?: 'claude' | 'omp';
+  /** Claude unless named; OMP reports a journal path, Hermes reports a native session id. */
+  agent?: 'claude' | 'omp' | 'hermes';
 }
 
 export const DEMO_WORKSPACES: readonly DemoWorkspace[] = [
@@ -54,11 +54,27 @@ export const DEMO_WORKSPACES: readonly DemoWorkspace[] = [
     agentStatus: 'idle',
     agent: 'omp',
   },
+  {
+    workspaceId: 'w5',
+    label: 'hermes',
+    number: 5,
+    paneId: 'w5:p1',
+    cwd: '/home/demo/hermes',
+    agentStatus: 'idle',
+    agent: 'hermes',
+  },
 ];
 
 /** Where the OMP demo agent keeps its journal, which herdr reports as its session. */
 export const DEMO_OMP_PATHS: Readonly<Record<string, string>> = {
   'w4:p1': '/home/demo/.omp/agent/sessions/--home-demo-ledger--/2026-09-28T09-00-00_44444444-4444-4444-8444-444444444444.jsonl',
+};
+
+export const DEMO_HERMES_DB = '/home/demo/.hermes/state.db';
+
+/** The Hermes native session id herdr reports. */
+export const DEMO_HERMES_SESSION_IDS: Readonly<Record<string, string>> = {
+  'w5:p1': 'session_hermes-demo',
 };
 
 /** The Claude session id each demo workspace reports, and therefore its transcript filename. */
@@ -205,6 +221,96 @@ export function ompLine(role: 'user' | 'assistant', text: string, id: string, ti
   return ompRecord(id, timestamp, role === 'user'
     ? { role, content: text }
     : { role, model: OMP_MODEL, content: [{ type: 'text', text }] });
+}
+
+// MARK: - Hermes
+//
+// Hermes persists messages in SQLite. The demo host does not fake a JSONL file:
+// it answers the small read-only helper protocol used by HermesTranscriptStore.
+
+export const HERMES_MODEL = 'openai/gpt-5.6';
+
+export interface HermesDemoRow {
+  row_id: number;
+  session_id: string;
+  role: 'user' | 'assistant' | 'tool';
+  content: string | null;
+  tool_call_id: string | null;
+  tool_calls: string | null;
+  tool_name: string | null;
+  effect_disposition: string | null;
+  timestamp: number;
+  token_count: number | null;
+  reasoning: string | null;
+  reasoning_content: string | null;
+  model: string | null;
+}
+
+const HERMES_JSON_PREFIX = '\0json:';
+
+function hermesTimestamp(timestamp: string): number {
+  return Date.parse(timestamp) / 1000;
+}
+
+function hermesText(text: string): string {
+  return `${HERMES_JSON_PREFIX}${JSON.stringify([{ type: 'text', text }])}`;
+}
+
+export function hermesRowsFor(paneId: string): readonly HermesDemoRow[] {
+  const session = DEMO_HERMES_SESSION_IDS[paneId];
+  if (session === undefined) return [];
+  return [
+    hermesUserRow(session, 1, 'summarise this Hermes session source', '2026-08-19T08:30:00.000Z'),
+    hermesAssistantRow(
+      session,
+      2,
+      'Hermes history is coming from the demo SQLite transport, not a Claude JSONL transcript.',
+      '2026-08-19T08:30:14.000Z',
+      'Reading rows from state.db.'
+    ),
+  ];
+}
+
+export function hermesUserRow(sessionId: string, rowId: number, text: string, timestamp: string): HermesDemoRow {
+  return {
+    row_id: rowId,
+    session_id: sessionId,
+    role: 'user',
+    content: text,
+    tool_call_id: null,
+    tool_calls: null,
+    tool_name: null,
+    effect_disposition: null,
+    timestamp: hermesTimestamp(timestamp),
+    token_count: null,
+    reasoning: null,
+    reasoning_content: null,
+    model: null,
+  };
+}
+
+export function hermesAssistantRow(
+  sessionId: string,
+  rowId: number,
+  text: string,
+  timestamp: string,
+  reasoning: string | null = null
+): HermesDemoRow {
+  return {
+    row_id: rowId,
+    session_id: sessionId,
+    role: 'assistant',
+    content: hermesText(text),
+    tool_call_id: null,
+    tool_calls: null,
+    tool_name: null,
+    effect_disposition: null,
+    timestamp: hermesTimestamp(timestamp),
+    token_count: 42_000,
+    reasoning,
+    reasoning_content: reasoning,
+    model: HERMES_MODEL,
+  };
 }
 
 /** The transcript a demo pane starts with, as the file's contents. */

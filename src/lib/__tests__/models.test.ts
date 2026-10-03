@@ -59,6 +59,23 @@ describe('snapshot decoding', () => {
     expect(bare.restoreErrors).toEqual([]);
   });
 
+  it('recognizes a Hermes plugin identity when Herdr omits the detected process kind', () => {
+    const [hermes, other, unknown] = decodeSnapshot({ agents: [
+      { pane_id: 'p1', agent_status: 'unknown', agent_session: {
+        agent: 'hermes', kind: 'id', source: 'herdr:hermes', value: '20261003_session',
+      } },
+      { pane_id: 'p2', agent: 'claude', agent_session: {
+        agent: 'hermes', kind: 'id', source: 'herdr:hermes', value: 'old-session',
+      } },
+      { pane_id: 'p3', agent_session: { agent: 'hermes', kind: 'path', value: '/unknown' } },
+    ] }).agents;
+    expect(hermes?.agent).toBe('hermes');
+    expect(hermes?.agentStatus).toBe('unknown');
+    expect(sessionSignature([hermes!])).toBe('hermes:20261003_session');
+    expect(other?.agent).toBe('claude');
+    expect(unknown?.agent).toBeNull();
+  });
+
   // Both counters are optional: 0.9.0 sends state_change_seq, only herdr
   // after #4457 sends completion_seq, and only for finished work (#115).
   it('reads the state and completion counters when herdr sends them', () => {
@@ -215,6 +232,20 @@ describe('session signature', () => {
   it('keeps Codex identity separate from a Claude session with the same id', () => {
     expect(sessionSignature([agent({ agent: 'codex' })])).toBe('codex:sess-a');
     expect(sessionSignature([agent({}), agent({ agent: 'codex' })])).toBe('codex:sess-a,sess-a');
+  });
+
+  it('keeps Hermes identity separate and requires Hermes own session report', () => {
+    const hermes = agent({
+      agent: 'hermes',
+      agentSession: { agent: 'hermes', kind: 'id', source: 'herdr:hermes', value: 'sess-a' },
+    });
+    expect(hasSessionReference(hermes)).toBe(true);
+    expect(sessionSignature([hermes])).toBe('hermes:sess-a');
+    expect(sessionSignature([agent({}), hermes])).toBe('hermes:sess-a,sess-a');
+    expect(hasSessionReference(agent({
+      agent: 'hermes',
+      agentSession: { agent: 'claude', kind: 'id', source: 'hook', value: 'sess-a' },
+    }))).toBe(false);
   });
 
   // Null, not "": a thread must be able to tell "no session yet" from "some

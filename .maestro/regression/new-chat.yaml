@@ -15,6 +15,7 @@ appId: dev.herdr.HerdrChat
 - tapOn:
     id: field-label
 - inputText: Regression
+- assertVisible: Hermes
 # Typing can leave the simulator's keyboard down; a tap on the field brings
 # it back, which is the state this flow is about.
 - tapOn:

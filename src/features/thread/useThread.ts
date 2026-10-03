@@ -16,6 +16,7 @@ import {
   type AgentStatus,
 } from '@/lib/herdr/models';
 import { TranscriptStore } from '@/lib/transcript/store';
+import { HermesTranscriptStore } from '@/lib/transcript/hermesStore';
 import type { ChatMessage, MessageSegment } from '@/lib/transcript/message';
 import { displayText, imagePaths, receiptKey } from '@/lib/transcript/message';
 import { promptWithImages } from '@/lib/transcript/images';
@@ -343,6 +344,8 @@ export function useThread(
     path: string;
     label: string | null;
     anchor: number;
+    /** Hermes pages by database row id; file transcripts page by UTF-8 byte. */
+    hermesSessionId?: string;
   } | null>(null);
   const boundSig = useRef<string | null>(null);
   /** The panes the bound session was seen in, sorted and joined. */
@@ -471,7 +474,11 @@ export function useThread(
         const current = olderSource.current;
         if (current === null || current.anchor <= 0) break;
 
-        const older = await store.older(current.path, current.label, current.anchor, OLDER_BYTES);
+        const older = current.hermesSessionId !== undefined
+          ? await new HermesTranscriptStore(client.transport).older(
+            current.path, current.hermesSessionId, current.label, current.anchor, RECENT_MESSAGES
+          ).then(page => ({ ...page, startByte: page.firstId }))
+          : await store.older(current.path, current.label, current.anchor, OLDER_BYTES);
         if (!alive.current || sig !== boundSig.current || olderSource.current !== current) return;
         olderSource.current = { ...current, anchor: older.startByte };
 
@@ -576,12 +583,30 @@ export function useThread(
 
     try {
       const store = new TranscriptStore(client.transport);
+      const hermesStore = new HermesTranscriptStore(client.transport);
       let openingError: string | null = null;
       const sources = (await Promise.all(identified.map(async agent => {
         try {
           const id = agent.agentSession!.value!;
           const key = sessionSignature([agent])!;
           const label = live.length > 1 ? agent.agent : null;
+          if (agent.agent === 'hermes') {
+            const path = await hermesStore.resolveSession(id);
+            if (path === null) {
+              const previous = absentRetry.current.get(key);
+              const delay = Math.min((previous?.delay ?? ABSENT_RETRY_MS / 2) * 2, ABSENT_RETRY_MAX_MS);
+              absentRetry.current.set(key, { at: Date.now() + delay, delay });
+              release(key);
+              return null;
+            }
+            const opening = await hermesStore.recent(path, id, label, RECENT_MESSAGES);
+            // Row checkpoints are scoped to both database and native session.
+            const cursorPath = `hermes:${encodeURIComponent(path)}:${encodeURIComponent(id)}`;
+            const cached = await tailCursor(db, connectionId, workspaceId, cursorPath);
+            absentRetry.current.delete(key);
+            return { key, path, cursorPath, label, agent: agent.agent,
+              position: opening.lastId, cached, hermesSessionId: id, opening };
+          }
           let path = agent.agent === 'omp'
             ? await store.ompTranscriptPath(id, agent.agentSession!.kind)
             : agent.agent === 'codex'
@@ -615,7 +640,8 @@ export function useThread(
           if (agent.agent === 'omp') await store.verifyOmpTranscript(path, agent.agentSession!.kind === 'id' ? id : null);
           absentRetry.current.delete(key);
           const cached = await tailCursor(db, connectionId, workspaceId, path);
-          return { key, path, label, agent: agent.agent, size: probe.bytes, cached };
+          return { key, path, cursorPath: path, label, agent: agent.agent,
+            position: probe.bytes, cached, hermesSessionId: undefined, opening: null };
         } catch (thrown) {
           release(sessionSignature([agent])!);
           openingError = thrown instanceof Error ? thrown.message : String(thrown);
@@ -626,10 +652,18 @@ export function useThread(
 
       // A cursor is a live-stream checkpoint, not a history-loading strategy.
       // Even a small backlog is read in bulk; an unchanged file can use cache.
-      const changed = arrivals.current.length === 0 || sources.some(source => source.cached !== source.size);
+      const changed = arrivals.current.length === 0 || sources.some(source => source.cached !== source.position);
       const windows = await Promise.all(sources.map(async source => ({
         ...source,
-        recent: changed ? await loadRecent(store, source.path, source.label, source.size) : null,
+        recent: changed
+          ? source.opening !== null
+            ? { messages: source.opening.messages, cursor: source.opening.lastId,
+              anchor: source.opening.firstId, reachedStart: source.opening.reachedStart }
+            : await loadRecent(store, source.path, source.label, source.position).then(page => ({
+              messages: page.messages, cursor: page.consumedBytes,
+              anchor: page.startByte, reachedStart: page.startByte <= 0,
+            }))
+          : null,
       })));
       if (!current()) return;
       if (changed && windows.length > 0) {
@@ -653,19 +687,23 @@ export function useThread(
 
       setTailError(openingError);
       for (const source of windows) {
-        const followFrom = source.recent?.consumedBytes ?? await resumePoint(store, source.path, source.cached!);
+        const followFrom = source.recent?.cursor ?? (source.hermesSessionId !== undefined
+          ? source.cached! : await resumePoint(store, source.path, source.cached!));
         if (source.recent !== null) {
-          await setTailCursor(db, connectionId, workspaceId, source.path, followFrom);
+          await setTailCursor(db, connectionId, workspaceId, source.cursorPath, followFrom);
         }
         if (!current()) return;
         if (olderSource.current === null) {
-          const anchor = source.recent?.startByte ?? source.cached!;
-          olderSource.current = { path: source.path, label: source.label, anchor };
-          setReachedStart(anchor <= 0);
+          const anchor = source.recent?.anchor ?? source.cached!;
+          olderSource.current = { path: source.path, label: source.label, anchor,
+            hermesSessionId: source.hermesSessionId };
+          setReachedStart(source.recent?.reachedStart ?? anchor <= 0);
         }
         if (!metaSeeded.current.has(source.key)) {
           metaSeeded.current.add(source.key);
-          void store.sessionMeta(source.path, source.agent).then(seeded => {
+          const metadata = source.opening !== null
+            ? Promise.resolve(source.opening.meta) : store.sessionMeta(source.path, source.agent);
+          void metadata.then(seeded => {
             if (seeded !== null && current()) setSessionMetadata(prev => ({
               ...prev,
               [source.key]: {
@@ -682,14 +720,18 @@ export function useThread(
         void (async () => {
           let restartNow = false;
           try {
-            for await (const chunk of store.tail(source.path, source.label, followFrom, controller.signal)) {
+            const stream = source.hermesSessionId !== undefined
+              ? hermesStore.tail(source.path, source.hermesSessionId, source.label, followFrom, controller.signal)
+              : store.tail(source.path, source.label, followFrom, controller.signal);
+            for await (const chunk of stream) {
               if (!current()) break;
               tailBeats.current.set(source.key, Date.now());
               tailFailures.current.delete(source.key);
               if (chunk.meta !== null) applyMeta(source.key, chunk.meta);
               if (chunk.message !== null) await ingest([chunk.message], sig);
               if (!current()) break;
-              await setTailCursor(db, connectionId, workspaceId, source.path, chunk.consumedBytes);
+              const cursor = 'lastId' in chunk ? chunk.lastId : chunk.consumedBytes;
+              await setTailCursor(db, connectionId, workspaceId, source.cursorPath, cursor);
             }
           } catch (thrown) {
             if (current()) {
@@ -806,7 +848,7 @@ export function useThread(
         const workspace = snapshot.workspaces?.find((item) => item.workspaceId === workspaceId);
         if (workspace !== undefined) setWorkspaceLabel(workspace.label.length > 0 ? workspace.label : null);
 
-        const conversational = live.filter((agent) => agent.agent === 'claude' || agent.agent === 'codex' || agent.agent === 'omp');
+        const conversational = live.filter((agent) => agent.agent === 'claude' || agent.agent === 'codex' || agent.agent === 'omp' || agent.agent === 'hermes');
         const unsupported = conversational.length === 0 && live.some(agent => agent.agent !== null);
         const sig = sessionSignature(conversational);
         const panes = conversational.map((agent) => agent.paneId).sort().join(',');

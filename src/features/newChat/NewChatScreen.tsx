@@ -26,12 +26,13 @@ import { useRemembered, useStartChat, type NewChatAgent } from './useNewChat';
 const AGENTS: readonly { value: NewChatAgent; label: string }[] = [
   { value: 'claude', label: 'Claude Code' },
   { value: 'codex', label: 'Codex' },
+  { value: 'hermes', label: 'Hermes' },
   { value: 'omp', label: 'OMP' },
 ];
 
 /**
  * Start a new conversation: create a workspace on the host at a chosen working
- * directory and launch Claude Code, Codex, or OMP in it.
+ * directory and launch Claude Code, Codex, Hermes, or OMP in it.
  */
 export default function NewChatScreen() {
   const router = useRouter();
@@ -165,6 +166,12 @@ export default function NewChatScreen() {
           </Text>
         )}
 
+        {agent === 'hermes' && (
+          <Text variant="caption" color="secondary">
+            Uses the model and permission settings configured on your host.
+          </Text>
+        )}
+
       </ScrollView>
 
       {/* Start is pinned below the form rather than at its end, for the reason
@@ -179,7 +186,7 @@ export default function NewChatScreen() {
           </Text>
         )}
         <Button
-          title={creating ? 'Starting…' : agent === 'codex' ? 'Start Codex' : 'Start Claude Code'}
+          title={creating ? 'Starting…' : `Start ${startName(agent)}`}
           onPress={() => void onStart()}
           loading={creating}
           disabled={cwd.trim().length === 0}
@@ -194,4 +201,11 @@ export default function NewChatScreen() {
       </KeyboardAvoidingView>
     </Screen>
   );
+}
+
+function startName(agent: NewChatAgent): string {
+  if (agent === 'claude') return 'Claude Code';
+  if (agent === 'codex') return 'Codex';
+  if (agent === 'hermes') return 'Hermes';
+  return 'OMP';
 }

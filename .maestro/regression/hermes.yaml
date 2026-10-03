@@ -1,0 +1,28 @@
+# A Hermes chat on the Demo: herdr reports a native session id, the app resolves
+# it to the demo SQLite transport, tails row ids, sends a prompt, and sees the
+# reply without using Claude JSONL transcript files.
+appId: dev.herdr.HerdrChat
+---
+- runFlow: _start.yaml
+- scrollUntilVisible:
+    element:
+      id: chat-row-w5
+    direction: DOWN
+- assertVisible: .*Hermes.*
+- tapOn:
+    id: chat-row-w5
+- extendedWaitUntil:
+    visible: .*demo SQLite transport.*
+    timeout: 15000
+# The provider prefix ("openai/") stays out of the header.
+- assertVisible: .*gpt-5.6.*
+- tapOn:
+    id: composer-input
+- inputText: does the demo sqlite path work?
+- runFlow: _send.yaml
+- extendedWaitUntil:
+    visible: .*You said .does the demo sqlite path work\?.*
+    timeout: 15000
+- takeScreenshot: hermes-thread-${APPEARANCE}
+- tapOn:
+    id: thread-back

@@ -19,6 +19,7 @@ function fakeClient() {
     createWorkspace: jest.fn(async () => creation(`w${(workspaces += 1)}`)),
     closeWorkspace: jest.fn(async () => undefined),
     startNamedAgent: jest.fn(async () => true),
+    installIntegration: jest.fn(async () => undefined),
   };
 }
 
@@ -52,12 +53,26 @@ it('closes the half-made workspace when the retry is for another folder', async 
 });
 
 // Non-Claude agents launch directly, without Claude's permission arguments.
-it.each(['codex', 'omp'] as const)('starts %s without Claude permission arguments', async (agent) => {
+it.each(['codex', 'hermes', 'omp'] as const)('starts %s without Claude permission arguments', async (agent) => {
   const client = fakeClient();
   const { result } = await renderHook(() => useStartChat('host'));
   await act(async () => {
     await result.current.start(client as unknown as HerdrClient, { ...choice, agent });
   });
   expect(client.startNamedAgent).toHaveBeenCalledWith('w1:p1', expect.any(String), agent, [], agent);
+  if (agent === 'hermes') {
+    expect(client.installIntegration).toHaveBeenCalledWith('hermes');
+    expect(client.installIntegration.mock.invocationCallOrder[0]).toBeLessThan(client.createWorkspace.mock.invocationCallOrder[0]!);
+  } else expect(client.installIntegration).not.toHaveBeenCalled();
   expect(mockDb.runAsync).toHaveBeenCalledWith(expect.stringContaining('INSERT INTO settings'), 'agent.host', agent);
+});
+
+it('creates no workspace when Hermes cannot be prepared on the host', async () => {
+  const client = fakeClient();
+  client.installIntegration.mockRejectedValue(new Error('custom Hermes detector needs review'));
+  const { result } = await renderHook(() => useStartChat('host'));
+  await act(async () => { await result.current.start(client as unknown as HerdrClient, { ...choice, agent: 'hermes' }); });
+  expect(result.current.error).toContain('custom Hermes detector needs review');
+  expect(client.createWorkspace).not.toHaveBeenCalled();
+  expect(client.startNamedAgent).not.toHaveBeenCalled();
 });
