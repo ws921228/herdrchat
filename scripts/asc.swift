@@ -9,11 +9,21 @@
 import Foundation
 import CryptoKit
 
-let BUNDLE_ID = "dev.herdr.HerdrChat"
-let APP_NAME = "HerdrChat"
-let APP_SKU = "herdrchat"
+let env = ProcessInfo.processInfo.environment
+let forkEnabled = env["HERDRCHAT_TESTFLIGHT_FORK"] == "1"
+func envOrDefault(_ key: String, _ fallback: String) -> String {
+    let value = env[key] ?? ""
+    return value.isEmpty ? fallback : value
+}
+
+let BUNDLE_ID = envOrDefault(
+    "HERDRCHAT_ASC_BUNDLE_ID",
+    envOrDefault("HERDRCHAT_IOS_BUNDLE_ID", forkEnabled ? "com.ws9212.herdrchat.hermes" : "dev.herdr.HerdrChat")
+)
+let APP_NAME = envOrDefault("HERDRCHAT_ASC_APP_NAME", forkEnabled ? "HerdrChat Hermes" : "HerdrChat")
+let APP_SKU = envOrDefault("HERDRCHAT_ASC_SKU", forkEnabled ? "herdrchat-hermes" : "herdrchat")
 let PRIMARY_LOCALE = "en-US"
-let TEAM_ID = ProcessInfo.processInfo.environment["APPLE_TEAM_ID"] ?? ""
+let TEAM_ID = env["APPLE_TEAM_ID"] ?? ""
 
 let args = CommandLine.arguments
 guard args.count >= 3 else {
@@ -22,7 +32,7 @@ guard args.count >= 3 else {
 }
 let issuerID = args[1]
 let cmd = args[2]
-let keyID = ProcessInfo.processInfo.environment["ASC_KEY_ID"] ?? ""
+let keyID = env["ASC_KEY_ID"] ?? ""
 let keyPath = ("~/.appstoreconnect/private_keys/AuthKey_\(keyID).p8" as NSString).expandingTildeInPath
 
 func die(_ msg: String) -> Never {
@@ -87,7 +97,7 @@ func attrs(_ item: [String: Any]) -> [String: Any] { (item["attributes"] as? [St
 
 // MARK: - Commands
 func probe() {
-    print("== App Store Connect probe (issuer \(issuerID.prefix(8))…, key \(keyID)) ==")
+    print("== App Store Connect probe (issuer \(issuerID.prefix(8))…, key \(keyID), bundle \(BUNDLE_ID)) ==")
 
     // Apps
     do {
@@ -196,8 +206,8 @@ func createDistCert(csrPath: String, outPath: String) {
     guard let csrPEM = try? String(contentsOfFile: csrPath, encoding: .utf8) else {
         die("cannot read CSR at \(csrPath)")
     }
-    // Reuse an existing DISTRIBUTION cert only if its private key is already
-    // local (it is not, on this machine) — so always create a fresh one.
+    // Reuse an existing DISTRIBUTION cert only when its private key is local.
+    // This helper creates a fresh certificate because it cannot prove that.
     let body: [String: Any] = ["data": [
         "type": "certificates",
         "attributes": ["certificateType": "DISTRIBUTION", "csrContent": csrPEM],
@@ -227,7 +237,7 @@ func createProfile(certID: String) {
     } catch { die("bundleIds query failed: \(error)") }
     guard let bid = bundleResourceID else { die("bundle id \(BUNDLE_ID) not registered") }
 
-    let name = "HerdrChat App Store"
+    let name = envOrDefault("HERDRCHAT_ASC_PROFILE_NAME", "\(APP_NAME) App Store")
     // Remove any stale profile of the same name to avoid a name-collision 409.
     do {
         let json = try request("GET", "/v1/profiles?limit=200")
@@ -253,7 +263,8 @@ func createProfile(certID: String) {
         }
         let dir = ("~/Library/MobileDevice/Provisioning Profiles" as NSString).expandingTildeInPath
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        let path = "\(dir)/HerdrChat_AppStore.mobileprovision"
+        let safeName = name.replacingOccurrences(of: "[^A-Za-z0-9_.-]+", with: "_", options: .regularExpression)
+        let path = "\(dir)/\(safeName).mobileprovision"
         try mp.write(to: URL(fileURLWithPath: path))
         print("✓ created App Store provisioning profile")
         print("PROFILE_NAME=\(name)")
@@ -343,7 +354,7 @@ func createPublicGroup() {
     print("PUBLIC_LINK=\(link ?? "(pending — re-run: swift scripts/asc.swift <issuer> public-link)")")
 }
 
-// List HerdrChat's builds and their processing/testing state.
+// List this app's builds and their processing/testing state.
 func builds() {
     var appID: String?
     do {
@@ -359,7 +370,7 @@ func builds() {
             print("No builds registered yet for \(BUNDLE_ID) — Apple is still processing the upload (wait a few minutes, then re-run).")
             return
         }
-        print("HerdrChat builds:")
+        print("\(APP_NAME) builds:")
         for b in items {
             let a = attrs(b)
             print("  • build \(a["version"] ?? "?")  state=\(a["processingState"] ?? "?")  uploaded=\(a["uploadedDate"] ?? "?")")

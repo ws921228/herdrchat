@@ -3,11 +3,34 @@
 Everything here is account-specific and comes from the environment; nothing
 about a particular Apple team is committed. A fork sets its own values.
 
+The checked-in `app.json` keeps the upstream App Store identity. For a personal
+TestFlight fork, opt into the fork flavor at build time:
+
+```bash
+export HERDRCHAT_TESTFLIGHT_FORK=1
+export HERDRCHAT_IOS_BUILD_NUMBER=1
+```
+
+That resolves Expo to:
+
+| Field | Fork default |
+|---|---|
+| App name | `HerdrChat Hermes` |
+| Slug | `herdrchat-hermes` |
+| URL scheme | `herdrchat-hermes` |
+| iOS bundle id | `com.ws9212.herdrchat.hermes` |
+
+Override those with `HERDRCHAT_APP_NAME`, `HERDRCHAT_APP_SLUG`,
+`HERDRCHAT_URL_SCHEME`, and `HERDRCHAT_IOS_BUNDLE_ID` if your Apple account
+needs a different value.
+
 ## One-time setup
 
 1. An Apple Developer account and an App Store Connect **app record** for the
-   bundle id in `app.json` (`expo.ios.bundleIdentifier`). The API cannot create
-   the record — do it once in the App Store Connect UI.
+   resolved Expo bundle id (`npx expo config --json`). Create the app record once
+   in the App Store Connect UI. `scripts/asc.swift <ISSUER_ID> ensure-app` registers
+   the bundle identifier and checks for the record; Apple can reject its attempt
+   to create a missing app record even with an Admin API key.
 2. An **App Store Connect API key** (Users and Access → Integrations), saved at
    `~/.appstoreconnect/private_keys/AuthKey_<KEYID>.p8`.
 3. A distribution certificate and an App Store provisioning profile installed
@@ -37,19 +60,23 @@ itself; an inherited `HERDR_SOCKET_PATH` would otherwise win over the session.
 
 ```bash
 # Bump the build number first — App Store Connect rejects a duplicate.
-#   app.json → expo.ios.buildNumber
+# Upstream app: app.json → expo.ios.buildNumber
+# Fork flavor: HERDRCHAT_IOS_BUILD_NUMBER=<next integer>
 
 APPLE_TEAM_ID=XXXXXXXXXX \
 ASC_KEY_ID=XXXXXXXXXX \
 ASC_ISSUER_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
+ASC_SIGNING_CERT=<sha1 of the Apple Distribution cert in the profile> \
   scripts/testflight.sh
 ```
 
 `--no-upload` stops after producing the `.ipa`, which is what you want when
 you only need to check that it builds and signs.
 
-Set `ASC_PROFILE_NAME` if your provisioning profile isn't named
-`HerdrChat App Store`.
+The script exports with local manual signing. Set `ASC_SIGNING_CERT` to the
+SHA-1 fingerprint of the Apple Distribution certificate that is actually in the
+provisioning profile. Set `ASC_PROFILE_NAME` if your provisioning profile isn't
+named `<resolved app name> App Store`.
 
 ### What the script checks before uploading
 
@@ -58,7 +85,8 @@ enforced rather than trusted:
 
 - The dev launcher is **not** embedded. A development build ships a server
   picker that would appear in front of the app on a tester's phone.
-- The archive's version and build number match `app.json`, which proves
+- The app signature is valid and its push entitlement matches the resolved config.
+- The archive's version and build number match the resolved Expo config, which proves
   `expo prebuild` actually ran rather than reusing a stale `ios/`.
 - Both halves of the SSH module are present — the native symbols in the binary
   and the module name in the JS bundle. Autolinking says nothing when it
@@ -179,4 +207,3 @@ The watcher the app installs on a host is embedded at build time. After
 changing `scripts/herdr-apns-notifier.py`, bump its `WATCHER_VERSION` (hosts
 running an older one are offered the update) and run
 `node scripts/embed-watcher.mjs`; a test fails until you do.
-
